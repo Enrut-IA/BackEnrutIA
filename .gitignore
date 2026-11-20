@@ -221,3 +221,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+#ignorar cache
+venv/
+cache/
+cache_grafos/
