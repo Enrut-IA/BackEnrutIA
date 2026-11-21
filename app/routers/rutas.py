@@ -5,6 +5,28 @@ router = APIRouter(
     prefix="/api/v1/rutas",
     tags=["Rutas y Entregas"]
 )
+@router.get("/empresa/asignados")
+def obtener_paquetes_empresa():
+    return {
+        "direccion_salida": "Portal Suba, Bogotá, Colombia",
+        "pedidos": [
+            {
+                "nombre": "Vanessa Torres",
+                "direccion": "Carrera 103A #141-45",
+                "rapida_entrega": True
+            },
+            {
+                "nombre": "Kenny Palacios",
+                "direccion": "Carrera 104 # 139",
+                "rapida_entrega": False
+            },
+            {
+                "nombre": "Camila Rojas",
+                "direccion": "Calle 145 # 90",
+                "rapida_entrega": False
+            }
+        ]
+    }
 
 
 @router.post("/iniciar", response_model=RespuestaRutaOptimizada)
@@ -54,4 +76,5 @@ def obtener_paquetes_empresa():
                 "rapida_entrega": False
             }
         ]
+        
     }

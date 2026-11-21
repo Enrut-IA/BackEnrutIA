@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import rutas
+from app.routers import perfiles, rutas
 
 app = FastAPI(
     title="Enrut.IA - API Backend",
@@ -19,7 +19,7 @@ app.add_middleware(
 
 # Registrar los módulos de endpoints
 app.include_router(rutas.router)
-
+app.include_router(perfiles.router)
 
 @app.get("/", tags=["Estado"])
 def health_check():
