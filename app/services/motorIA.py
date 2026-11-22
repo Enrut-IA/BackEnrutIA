@@ -1,14 +1,21 @@
 import os
-import re
 import json
+import math
 import time
+import logging
+import threading
 import numpy as np
 import osmnx as ox
 import networkx as nx
+import requests
+from osmnx._errors import InsufficientResponseError, ResponseStatusCodeError
+
+from app.services.geocodificador import geocodificar_punto, ErrorServidorMapas
 
 ox.settings.log_console = False
 ox.settings.use_cache = True
 ox.settings.requests_timeout = 120
+ox.settings.overpass_rate_limit = False
 try:
     ox.settings.http_user_agent = "EnrutIA_Bogota_Backend/1.0"
 except AttributeError:
@@ -16,121 +23,175 @@ except AttributeError:
 
 # Carpeta persistente en disco para grafos (.graphml) y direcciones (.json)
 CARPETA_CACHE = "cache_grafos"
-ARCHIVO_DIRECCIONES = os.path.join(CARPETA_CACHE, "direcciones.json")
+ARCHIVO_CUADROS_VACIOS = os.path.join(CARPETA_CACHE, "cuadros_vacios.json")
 os.makedirs(CARPETA_CACHE, exist_ok=True)
 
+TAMANO_CUADRO = 0.02
+MARGEN_CUADRO = 0.002
+SERVIDORES_OVERPASS = [
+    "https://overpass-api.de/api",
+    "https://maps.mail.ru/osm/tools/overpass/api",
+]
+ESPERAS_REINTENTO = (0, 5, 10, 20)
+MAX_GRAFOS_EN_MEMORIA = 8
 
-def _cargar_cache_direcciones() -> dict:
-    if os.path.exists(ARCHIVO_DIRECCIONES):
+registro = logging.getLogger(__name__)
+_cuadros_en_memoria = {}
+_grafos_combinados = {}
+_candado_cuadros = threading.Lock()
+
+
+def _indices_cuadros(sur: float, norte: float, oeste: float, este: float) -> list:
+    filas = range(math.floor(sur / TAMANO_CUADRO), math.floor(norte / TAMANO_CUADRO) + 1)
+    columnas = range(math.floor(oeste / TAMANO_CUADRO), math.floor(este / TAMANO_CUADRO) + 1)
+    return [(fila, columna) for fila in filas for columna in columnas]
+
+
+def _cargar_cuadros_vacios() -> set:
+    if os.path.exists(ARCHIVO_CUADROS_VACIOS):
         try:
-            with open(ARCHIVO_DIRECCIONES, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(ARCHIVO_CUADROS_VACIOS, "r", encoding="utf-8") as f:
+                return set(json.load(f))
         except Exception:
-            return {}
-    return {}
+            return set()
+    return set()
 
 
-def _guardar_cache_direcciones(cache: dict):
-    with open(ARCHIVO_DIRECCIONES, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
+def _guardar_cuadro_vacio(nombre: str):
+    vacios = _cargar_cuadros_vacios()
+    vacios.add(nombre)
+    with open(ARCHIVO_CUADROS_VACIOS, "w", encoding="utf-8") as f:
+        json.dump(sorted(vacios), f)
 
 
-def _traducir_direccion_colombiana(texto: str) -> list:
-    """
-    Convierte nomenclatura vial colombiana con '#' y '-' (ej. 'Carrera 103A #141-45'
-    o 'Cr 104 # 139') en cruces viales que OpenStreetMap puede geocodificar.
-    """
-    limpio = re.sub(r"\s+", " ", texto).strip()
-
-    abreviaturas = [
-        (r"\b(cr|cra|kr|kra)\.?\b", "Carrera"),
-        (r"\b(cl|cll)\.?\b", "Calle"),
-        (r"\b(av|ak|ac)\.?\b", "Avenida"),
-        (r"\b(dg|diag)\.?\b", "Diagonal"),
-        (r"\b(tv|transv)\.?\b", "Transversal"),
-    ]
-    for patron, reemplazo in abreviaturas:
-        limpio = re.sub(patron, reemplazo, limpio, flags=re.IGNORECASE)
-
-    consultas = []
-    match = re.match(r"^(.*?)\s*(?:#|No\.?|N°)\s*(\d+[A-Za-z]?)(?:\s*-\s*\d+)?(.*)$", limpio, flags=re.IGNORECASE)
-    if match:
-        via_principal = match.group(1).strip()
-        num_cruce = match.group(2).strip()
-
-        if re.search(r"\b(carrera|avenida carrera)\b", via_principal, flags=re.IGNORECASE):
-            via_cruce = f"Calle {num_cruce}"
-        elif re.search(r"\b(calle|avenida calle)\b", via_principal, flags=re.IGNORECASE):
-            via_cruce = f"Carrera {num_cruce}"
-        else:
-            via_cruce = f"Calle {num_cruce}"
-
-        consultas.append(f"{via_principal} & {via_cruce}, Bogotá, Colombia")
-        consultas.append(f"{via_cruce}, {via_principal}, Bogotá, Colombia")
-
-    sin_simbolos = re.sub(r"[#-]", " ", limpio)
-    sin_simbolos = re.sub(r"\s+", " ", sin_simbolos).strip()
-    if "bogotá" not in sin_simbolos.lower() and "bogota" not in sin_simbolos.lower():
-        consultas.append(f"{sin_simbolos}, Bogotá, Colombia")
-    else:
-        consultas.append(sin_simbolos)
-
-    return list(dict.fromkeys(consultas))
+def _pedir_grafo(sur: float, norte: float, oeste: float, este: float):
+    opciones = {"network_type": "drive", "simplify": False, "retain_all": True, "truncate_by_edge": True}
+    try:
+        return ox.graph_from_bbox(bbox=(oeste, sur, este, norte), **opciones)
+    except TypeError:
+        return ox.graph_from_bbox(norte, sur, este, oeste, **opciones)
 
 
-def geocodificar_punto(direccion: str, lat: float = None, lon: float = None) -> tuple:
-    """Retorna (lat, lon) desde coordenadas directas, caché JSON en disco o Nominatim."""
-    if lat is not None and lon is not None:
-        return float(lat), float(lon)
+def _es_zona_sin_calles(error: Exception) -> bool:
+    texto = str(error)
+    return texto.startswith("No data elements") or "no graph nodes" in texto.lower()
 
-    cache_dirs = _cargar_cache_direcciones()
-    clave = direccion.strip().lower()
-    if clave in cache_dirs:
-        return tuple(cache_dirs[clave])
 
-    consultas = _traducir_direccion_colombiana(direccion)
-    for consulta in consultas:
-        try:
-            time.sleep(1.0)
-            lat_res, lon_res = ox.geocode(consulta)
-            coords = [float(lat_res), float(lon_res)]
-            cache_dirs[clave] = coords
-            _guardar_cache_direcciones(cache_dirs)
-            return tuple(coords)
-        except Exception:
+def _limites_cuadro(fila: int, columna: int) -> tuple:
+    return (
+        fila * TAMANO_CUADRO - MARGEN_CUADRO,
+        (fila + 1) * TAMANO_CUADRO + MARGEN_CUADRO,
+        columna * TAMANO_CUADRO - MARGEN_CUADRO,
+        (columna + 1) * TAMANO_CUADRO + MARGEN_CUADRO,
+    )
+
+
+def _descargar_zona(sur: float, norte: float, oeste: float, este: float):
+    servidor_original = ox.settings.overpass_url
+    sin_conexion = True
+    ultimo_error = None
+    try:
+        for espera in ESPERAS_REINTENTO:
+            time.sleep(espera)
+            for servidor in SERVIDORES_OVERPASS:
+                ox.settings.overpass_url = servidor
+                try:
+                    return _pedir_grafo(sur, norte, oeste, este)
+                except ResponseStatusCodeError as e:
+                    sin_conexion = False
+                    ultimo_error = e
+                except requests.ConnectionError as e:
+                    ultimo_error = e
+                except requests.RequestException as e:
+                    sin_conexion = False
+                    ultimo_error = e
+                except (InsufficientResponseError, ValueError) as e:
+                    if _es_zona_sin_calles(e):
+                        return None
+                    sin_conexion = False
+                    ultimo_error = e
+    finally:
+        ox.settings.overpass_url = servidor_original
+
+    registro.warning("No se pudo descargar la zona (%s, %s, %s, %s): %s", sur, norte, oeste, este, ultimo_error)
+    if sin_conexion:
+        raise ErrorServidorMapas(
+            "No se pudo descargar el mapa de la zona. Revisa tu conexión a internet e intenta de nuevo."
+        )
+    raise ErrorServidorMapas(
+        "El servidor de mapas está ocupado en este momento. Intenta calcular la ruta de nuevo en unos segundos."
+    )
+
+
+def _recortar_cuadro(grafo, fila: int, columna: int):
+    if grafo is None:
+        return None
+    sur, norte, oeste, este = _limites_cuadro(fila, columna)
+    try:
+        cuadro = ox.truncate.truncate_graph_bbox(grafo, (oeste, sur, este, norte), truncate_by_edge=True)
+    except ValueError:
+        return None
+    return cuadro if cuadro.number_of_nodes() > 0 else None
+
+
+def _obtener_cuadros(cuadros: list) -> list:
+    vacios = _cargar_cuadros_vacios()
+    faltantes = []
+    for fila, columna in cuadros:
+        nombre = f"{fila}_{columna}"
+        archivo = os.path.join(CARPETA_CACHE, f"cuadro_{nombre}.graphml")
+        if (fila, columna) in _cuadros_en_memoria:
             continue
+        if os.path.exists(archivo):
+            _cuadros_en_memoria[(fila, columna)] = ox.load_graphml(archivo)
+        elif nombre in vacios:
+            _cuadros_en_memoria[(fila, columna)] = None
+        else:
+            faltantes.append((fila, columna))
 
-    raise ValueError(f"No se pudo ubicar la dirección '{direccion}' en el mapa de Bogotá.")
+    if faltantes:
+        limites = [_limites_cuadro(fila, columna) for fila, columna in faltantes]
+        zona = _descargar_zona(
+            min(l[0] for l in limites),
+            max(l[1] for l in limites),
+            min(l[2] for l in limites),
+            max(l[3] for l in limites),
+        )
+        for fila, columna in faltantes:
+            nombre = f"{fila}_{columna}"
+            cuadro = _recortar_cuadro(zona, fila, columna)
+            if cuadro is None:
+                _guardar_cuadro_vacio(nombre)
+            else:
+                ox.save_graphml(cuadro, os.path.join(CARPETA_CACHE, f"cuadro_{nombre}.graphml"))
+            _cuadros_en_memoria[(fila, columna)] = cuadro
+
+    return [_cuadros_en_memoria[c] for c in cuadros if _cuadros_en_memoria[c] is not None]
 
 
 def obtener_subgrafo_bbox(coordenadas: list, margen: float = 0.008):
-    """
-    Carga el subgrafo desde disco (.graphml) si la zona ya fue consultada antes.
-    Si es una zona nueva, la descarga por Bounding Box y la guarda en disco.
-    """
+    """Une los cuadros de la zona guardados en disco y descarga solo los que falten."""
     lats = [c[0] for c in coordenadas]
     lons = [c[1] for c in coordenadas]
 
-    norte = round(max(lats) + margen, 2)
-    sur = round(min(lats) - margen, 2)
-    este = round(max(lons) + margen, 2)
-    oeste = round(min(lons) - margen, 2)
+    cuadros = _indices_cuadros(min(lats) - margen, max(lats) + margen, min(lons) - margen, max(lons) + margen)
+    clave = tuple(sorted(cuadros))
+    with _candado_cuadros:
+        if clave in _grafos_combinados:
+            return _grafos_combinados[clave]
 
-    archivo_grafo = os.path.join(CARPETA_CACHE, f"grafo_{sur}_{norte}_{oeste}_{este}.graphml")
+        grafos = _obtener_cuadros(cuadros)
+        if not grafos:
+            raise ValueError("No se encontraron calles en la zona de las direcciones.")
 
-    if os.path.exists(archivo_grafo):
-        return ox.load_graphml(archivo_grafo)
+        combinado = ox.simplify_graph(nx.compose_all(grafos))
+        comp_mayor = max(nx.strongly_connected_components(combinado), key=len)
+        grafo_final = combinado.subgraph(comp_mayor).copy()
 
-    try:
-        grafo = ox.graph_from_bbox(bbox=(oeste, sur, este, norte), network_type="drive", truncate_by_edge=True)
-    except TypeError:
-        grafo = ox.graph_from_bbox(norte, sur, este, oeste, network_type="drive", truncate_by_edge=True)
-
-    comp_mayor = max(nx.strongly_connected_components(grafo), key=len)
-    grafo_final = grafo.subgraph(comp_mayor).copy()
-
-    ox.save_graphml(grafo_final, archivo_grafo)
-    return grafo_final
+        if len(_grafos_combinados) >= MAX_GRAFOS_EN_MEMORIA:
+            _grafos_combinados.pop(next(iter(_grafos_combinados)))
+        _grafos_combinados[clave] = grafo_final
+        return grafo_final
 
 
 def calcular_matriz_distancias(grafo, nodos_unicos: list) -> dict:
@@ -249,7 +310,7 @@ def calcular_ruta_entregas(salida: dict, lista_pedidos: list) -> dict:
 
     pedidos_geocodificados = []
     for p in lista_pedidos:
-        lat_p, lon_p = geocodificar_punto(p["direccion"], p.get("lat"), p.get("lon"))
+        lat_p, lon_p = geocodificar_punto(p["direccion"], p.get("lat"), p.get("lon"), (lat_sal, lon_sal))
         pedidos_geocodificados.append({**p, "lat": lat_p, "lon": lon_p})
 
     todas_coords = [(lat_sal, lon_sal)] + [(p["lat"], p["lon"]) for p in pedidos_geocodificados]

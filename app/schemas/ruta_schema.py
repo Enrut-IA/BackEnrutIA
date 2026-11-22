@@ -44,6 +44,19 @@ class SolicitudIniciarRuta(BaseModel):
 
 
 
+class SolicitudGeocodificar(BaseModel):
+    direccion: str = Field(..., min_length=5)
+    lat_referencia: Optional[float] = Field(default=None)
+    lon_referencia: Optional[float] = Field(default=None)
+
+
+class RespuestaGeocodificar(BaseModel):
+    direccion: str
+    lat: float
+    lon: float
+    metodo: str
+
+
 class ParadaRutaSalida(BaseModel):
     orden: int
     tipo: str               # "salida" o "pedido"
