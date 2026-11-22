@@ -1,5 +1,11 @@
 from fastapi import APIRouter, HTTPException
-from app.schemas.ruta_schema import SolicitudIniciarRuta, RespuestaRutaOptimizada
+from app.schemas.ruta_schema import (
+    SolicitudIniciarRuta,
+    RespuestaRutaOptimizada,
+    SolicitudGeocodificar,
+    RespuestaGeocodificar,
+)
+from app.services.geocodificador import ubicar_direccion
 from app.services.motorIA import calcular_ruta_entregas
 router = APIRouter(
     prefix="/api/v1/rutas",
@@ -49,6 +55,18 @@ def iniciar_ruta_optimizada(solicitud: SolicitudIniciarRuta):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error interno calculando la ruta: {str(e)}")
+
+
+@router.post("/geocodificar", response_model=RespuestaGeocodificar)
+def geocodificar_direccion(solicitud: SolicitudGeocodificar):
+    referencia = None
+    if solicitud.lat_referencia is not None and solicitud.lon_referencia is not None:
+        referencia = (solicitud.lat_referencia, solicitud.lon_referencia)
+    try:
+        lat, lon, metodo = ubicar_direccion(solicitud.direccion, referencia=referencia)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"direccion": solicitud.direccion, "lat": lat, "lon": lon, "metodo": metodo}
 
 
 @router.get("/empresa/asignados", response_model=SolicitudIniciarRuta)
