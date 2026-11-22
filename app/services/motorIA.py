@@ -1,10 +1,10 @@
 import os
-import re
-import json
 import time
 import numpy as np
 import osmnx as ox
 import networkx as nx
+
+from app.services.geocodificador import geocodificar_punto
 
 ox.settings.log_console = False
 ox.settings.use_cache = True
@@ -16,91 +16,7 @@ except AttributeError:
 
 # Carpeta persistente en disco para grafos (.graphml) y direcciones (.json)
 CARPETA_CACHE = "cache_grafos"
-ARCHIVO_DIRECCIONES = os.path.join(CARPETA_CACHE, "direcciones.json")
 os.makedirs(CARPETA_CACHE, exist_ok=True)
-
-
-def _cargar_cache_direcciones() -> dict:
-    if os.path.exists(ARCHIVO_DIRECCIONES):
-        try:
-            with open(ARCHIVO_DIRECCIONES, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-
-def _guardar_cache_direcciones(cache: dict):
-    with open(ARCHIVO_DIRECCIONES, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
-
-
-def _traducir_direccion_colombiana(texto: str) -> list:
-    """
-    Convierte nomenclatura vial colombiana con '#' y '-' (ej. 'Carrera 103A #141-45'
-    o 'Cr 104 # 139') en cruces viales que OpenStreetMap puede geocodificar.
-    """
-    limpio = re.sub(r"\s+", " ", texto).strip()
-
-    abreviaturas = [
-        (r"\b(cr|cra|kr|kra)\.?\b", "Carrera"),
-        (r"\b(cl|cll)\.?\b", "Calle"),
-        (r"\b(av|ak|ac)\.?\b", "Avenida"),
-        (r"\b(dg|diag)\.?\b", "Diagonal"),
-        (r"\b(tv|transv)\.?\b", "Transversal"),
-    ]
-    for patron, reemplazo in abreviaturas:
-        limpio = re.sub(patron, reemplazo, limpio, flags=re.IGNORECASE)
-
-    consultas = []
-    match = re.match(r"^(.*?)\s*(?:#|No\.?|N°)\s*(\d+[A-Za-z]?)(?:\s*-\s*\d+)?(.*)$", limpio, flags=re.IGNORECASE)
-    if match:
-        via_principal = match.group(1).strip()
-        num_cruce = match.group(2).strip()
-
-        if re.search(r"\b(carrera|avenida carrera)\b", via_principal, flags=re.IGNORECASE):
-            via_cruce = f"Calle {num_cruce}"
-        elif re.search(r"\b(calle|avenida calle)\b", via_principal, flags=re.IGNORECASE):
-            via_cruce = f"Carrera {num_cruce}"
-        else:
-            via_cruce = f"Calle {num_cruce}"
-
-        consultas.append(f"{via_principal} & {via_cruce}, Bogotá, Colombia")
-        consultas.append(f"{via_cruce}, {via_principal}, Bogotá, Colombia")
-
-    sin_simbolos = re.sub(r"[#-]", " ", limpio)
-    sin_simbolos = re.sub(r"\s+", " ", sin_simbolos).strip()
-    if "bogotá" not in sin_simbolos.lower() and "bogota" not in sin_simbolos.lower():
-        consultas.append(f"{sin_simbolos}, Bogotá, Colombia")
-    else:
-        consultas.append(sin_simbolos)
-
-    return list(dict.fromkeys(consultas))
-
-
-def geocodificar_punto(direccion: str, lat: float = None, lon: float = None) -> tuple:
-    """Retorna (lat, lon) desde coordenadas directas, caché JSON en disco o Nominatim."""
-    if lat is not None and lon is not None:
-        return float(lat), float(lon)
-
-    cache_dirs = _cargar_cache_direcciones()
-    clave = direccion.strip().lower()
-    if clave in cache_dirs:
-        return tuple(cache_dirs[clave])
-
-    consultas = _traducir_direccion_colombiana(direccion)
-    for consulta in consultas:
-        try:
-            time.sleep(1.0)
-            lat_res, lon_res = ox.geocode(consulta)
-            coords = [float(lat_res), float(lon_res)]
-            cache_dirs[clave] = coords
-            _guardar_cache_direcciones(cache_dirs)
-            return tuple(coords)
-        except Exception:
-            continue
-
-    raise ValueError(f"No se pudo ubicar la dirección '{direccion}' en el mapa de Bogotá.")
 
 
 def obtener_subgrafo_bbox(coordenadas: list, margen: float = 0.008):
@@ -249,7 +165,7 @@ def calcular_ruta_entregas(salida: dict, lista_pedidos: list) -> dict:
 
     pedidos_geocodificados = []
     for p in lista_pedidos:
-        lat_p, lon_p = geocodificar_punto(p["direccion"], p.get("lat"), p.get("lon"))
+        lat_p, lon_p = geocodificar_punto(p["direccion"], p.get("lat"), p.get("lon"), (lat_sal, lon_sal))
         pedidos_geocodificados.append({**p, "lat": lat_p, "lon": lon_p})
 
     todas_coords = [(lat_sal, lon_sal)] + [(p["lat"], p["lon"]) for p in pedidos_geocodificados]
