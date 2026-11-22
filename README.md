@@ -16,10 +16,10 @@ BackEnrutIA/
 │   │   └── ruta_schema.py       # Contratos Pydantic de entrada y salida de datos
 │   └── services/
 │       ├── geocodificador.py    # Ubicación de direcciones por cruce de vías y caché en disco
-│       └── motorIA.py           # Subgrafos viales y motor ACO 2.0
+│       └── motorIA.py           # Mapa vial por cuadros y motor ACO 2.0
 ├── tests/
 │   └── test_motor.py            # Pruebas en consola del motor de optimización
-├── cache_grafos/                # Caché local (.graphml, direcciones.json y calles_bogota.json) [Ignorada en Git]
+├── cache_grafos/                # Caché local (cuadros .graphml, direcciones.json y calles_bogota.json) [Ignorada en Git]
 ├── requirements.txt             # Dependencias exactas del entorno Python
 ├── .gitignore                   # Exclusión de entorno virtual, caché y archivos temporales
 └── README.md                    # Guía de instalación, arquitectura y pruebas
@@ -31,7 +31,7 @@ BackEnrutIA/
 * **`app/routers/rutas.py`:** Define los endpoints bajo `/api/v1/rutas` (`POST /iniciar` para calcular la ruta óptima a partir de un punto de salida, pedidos y prioridad `rapida_entrega`, `POST /geocodificar` para obtener las coordenadas de una dirección antes de confirmarla en el mapa, y `GET /empresa/asignados` para consultar un lote predefinido de empresa).
 * **`app/schemas/ruta_schema.py`:** Valida los JSON de entrada y salida con **Pydantic**, normaliza el campo `rapida_entrega` (`"si"` / `"No"` o booleano) y acepta coordenadas GPS opcionales junto a la dirección.
 * **`app/services/geocodificador.py`:** Interpreta la nomenclatura vial colombiana (`#`, `-`, `Bis`, `Sur`, `Este` y abreviaturas como `Cr`, `Cl`, `Ak`, `Ac`) y ubica la dirección en el cruce de la vía principal con la vía generadora, avanzando sobre la vía los metros que indica la placa (ej. `Carrera 103A #141-45`: 45 m desde la esquina con la Calle 141). Si la vía de cruce no existe en el mapa, interpola entre las calles vecinas. Las calles de Bogotá se descargan una sola vez de OpenStreetMap y se guardan en `cache_grafos/calles_bogota.json`; las direcciones ya ubicadas quedan en `cache_grafos/direcciones.json`. Para lugares sin nomenclatura (ej. `Portal Suba`) usa Nominatim limitado a Bogotá.
-* **`app/services/motorIA.py`:** Extrae únicamente el rectángulo de calles necesario (*Bounding Box*), guarda los grafos (`.graphml`) en `cache_grafos/` para reutilizarlos en futuras consultas y ejecuta **ACO 2.0** con autoajuste de hormigas ($m = n$) y parada por estancamiento.
+* **`app/services/motorIA.py`:** Divide Bogotá en una cuadrícula fija de cuadros de ~2 km y arma el mapa vial de cada ruta uniendo los cuadros que cubren sus direcciones. Cada cuadro se descarga una sola vez (los que falten se piden juntos en una sola consulta) y se guarda en `cache_grafos/cuadro_<fila>_<columna>.graphml`, así las rutas siguientes en la misma zona no necesitan internet. Si el servidor de mapas está saturado reintenta con esperas crecientes y un servidor alterno, y si no lo logra responde un mensaje claro en español. Luego ejecuta **ACO 2.0** con autoajuste de hormigas ($m = n$) y parada por estancamiento.
 * **`tests/test_motor.py`:** Permite ejecutar pruebas directas en consola sobre el motor de optimización sin necesidad de arrancar el servidor HTTP.
 * **Librerías de Python (`requirements.txt`):**
   * `fastapi`: Framework web para construir la API REST y generar la documentación interactiva en Swagger UI.

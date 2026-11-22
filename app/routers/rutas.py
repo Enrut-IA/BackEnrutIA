@@ -5,8 +5,12 @@ from app.schemas.ruta_schema import (
     SolicitudGeocodificar,
     RespuestaGeocodificar,
 )
-from app.services.geocodificador import ubicar_direccion
+import logging
+
+from app.services.geocodificador import ubicar_direccion, ErrorServidorMapas
 from app.services.motorIA import calcular_ruta_entregas
+
+registro = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/api/v1/rutas",
     tags=["Rutas y Entregas"]
@@ -51,10 +55,13 @@ def iniciar_ruta_optimizada(solicitud: SolicitudIniciarRuta):
 
         return calcular_ruta_entregas(salida, pedidos)
 
+    except ErrorServidorMapas as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno calculando la ruta: {str(e)}")
+    except Exception:
+        registro.exception("Error calculando la ruta")
+        raise HTTPException(status_code=500, detail="Ocurrió un error calculando la ruta. Intenta de nuevo.")
 
 
 @router.post("/geocodificar", response_model=RespuestaGeocodificar)
@@ -64,6 +71,8 @@ def geocodificar_direccion(solicitud: SolicitudGeocodificar):
         referencia = (solicitud.lat_referencia, solicitud.lon_referencia)
     try:
         lat, lon, metodo = ubicar_direccion(solicitud.direccion, referencia=referencia)
+    except ErrorServidorMapas as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"direccion": solicitud.direccion, "lat": lat, "lon": lon, "metodo": metodo}

@@ -52,6 +52,10 @@ PATRON_DIRECCION = re.compile(
 _indice_calles = None
 
 
+class ErrorServidorMapas(Exception):
+    pass
+
+
 def _cargar_cache() -> dict:
     if os.path.exists(ARCHIVO_DIRECCIONES):
         try:
@@ -338,21 +342,28 @@ def ubicar_direccion(direccion: str, lat: float = None, lon: float = None, refer
 
     datos = interpretar_direccion(direccion)
     resultado = None
+    servidor_caido = False
 
     if datos is not None:
         referencia_m = Point(_a_metros(*referencia)) if referencia else None
         try:
             resultado = _ubicar_por_cruce(datos, referencia_m)
         except requests.RequestException:
-            resultado = None
+            servidor_caido = True
 
     if resultado is None:
         try:
             encontrado = _consultar_nominatim(direccion, datos)
         except (requests.RequestException, ValueError):
             encontrado = None
+            servidor_caido = True
         if encontrado:
             resultado = (*encontrado, "nominatim")
+
+    if resultado is None and servidor_caido:
+        raise ErrorServidorMapas(
+            "El servidor de mapas está ocupado en este momento. Intenta de nuevo en unos segundos."
+        )
 
     if resultado is None or not _dentro_de_bogota(resultado[0], resultado[1]):
         raise ValueError(
